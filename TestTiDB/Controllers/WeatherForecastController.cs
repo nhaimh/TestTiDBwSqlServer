@@ -34,9 +34,9 @@ public class IRISController : ControllerBase
                     decimal currentBalance;
                     using (var checkCmd = new MySqlCommand(
                         @"SELECT Balance
-                      FROM Balances
-                      WHERE UserId = @UserId
-                      FOR UPDATE;", connection, transaction))
+                          FROM Balances
+                          WHERE UserId = @UserId
+                          FOR UPDATE;", connection, transaction))
                     {
                         checkCmd.Parameters.AddWithValue("@UserId", userId);
                         var result = await checkCmd.ExecuteScalarAsync();
@@ -49,39 +49,44 @@ public class IRISController : ControllerBase
 
                     decimal newBalance = currentBalance + changeAmount;
 
-                    using (var combinedCmd = new MySqlCommand(
+                    using (var updateCmd = new MySqlCommand(
                         @"UPDATE Balances
-                      SET Balance = @NewBalance,
-                          LastUpdatedAt = NOW()
-                      WHERE UserId = @UserId
-                        AND Balance >= @MinBalanceRequired;
-
-                      INSERT INTO BalanceHistory
-                        (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason)
-                      VALUES
-                        (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason);", connection, transaction))
+                            SET Balance = @NewBalance,
+                                LastUpdatedAt = NOW()
+                          WHERE UserId = @UserId
+                            AND Balance >= @MinBalanceRequired;", connection, transaction))
                     {
-                        combinedCmd.Parameters.AddWithValue("@NewBalance", newBalance);
-                        combinedCmd.Parameters.AddWithValue("@UserId", userId);
-                        combinedCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
-                        combinedCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
-                        combinedCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
+                        updateCmd.Parameters.AddWithValue("@NewBalance", newBalance);
+                        updateCmd.Parameters.AddWithValue("@UserId", userId);
+                        decimal minBalanceRequired = 0 - changeAmount;
+                        updateCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
 
-                        decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
-                        combinedCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
-                        combinedCmd.Parameters.AddWithValue("@Reason", reason);
+                        int rowsAffected = await updateCmd.ExecuteNonQueryAsync();
 
-                        int rowsAffected = await combinedCmd.ExecuteNonQueryAsync();
-
-                        if (rowsAffected < 2)
+                        if (rowsAffected <= 0)
                         {
-                            // Không đủ điều kiện (vd: rút tiền nhưng số dư không đủ)
                             await transaction.RollbackAsync();
                             return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
                         }
-
-                        await transaction.CommitAsync();
                     }
+
+                    using (var insertCmd = new MySqlCommand(
+                        @"INSERT INTO BalanceHistory
+                            (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason)
+                          VALUES
+                            (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason);", connection, transaction))
+                    {
+                        insertCmd.Parameters.AddWithValue("@UserId", userId);
+                        insertCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
+                        insertCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
+                        insertCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
+                        insertCmd.Parameters.AddWithValue("@Reason", reason);
+
+                        await insertCmd.ExecuteNonQueryAsync();
+                    }
+
+                    await transaction.CommitAsync();
+
                 }
                 catch (Exception ex)
                 {
@@ -171,39 +176,44 @@ public class IRISController : ControllerBase
                         }
 
                         decimal newBalance = currentBalance + changeAmount;
-
-                        using (var combinedCmd = new SqlCommand(
+                        using (var updateCmd = new SqlCommand(
                             @"UPDATE Balances
                               SET Balance = @NewBalance,
                                   LastUpdatedAt = GETDATE()
                               WHERE UserId = @UserId
-                                AND Balance >= @MinBalanceRequired;
-
-                              INSERT INTO BalanceHistory
-                                (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason, CreatedAt)
-                              VALUES
-                                (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason, GETDATE());", connection, (SqlTransaction)transaction))
+                                AND Balance >= @MinBalanceRequired;", connection, (SqlTransaction)transaction))
                         {
-                            combinedCmd.Parameters.AddWithValue("@NewBalance", newBalance);
-                            combinedCmd.Parameters.AddWithValue("@UserId", userId);
-                            combinedCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
-                            combinedCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
-                            combinedCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
-
+                            updateCmd.Parameters.AddWithValue("@NewBalance", newBalance);
+                            updateCmd.Parameters.AddWithValue("@UserId", userId);
                             decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
-                            combinedCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
-                            combinedCmd.Parameters.AddWithValue("@Reason", reason ?? string.Empty);
+                            updateCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
 
-                            int rowsAffected = await combinedCmd.ExecuteNonQueryAsync();
+                            int rowsAffected = await updateCmd.ExecuteNonQueryAsync();
 
-                            if (rowsAffected < 2)
+                            if (rowsAffected <= 0)
                             {
                                 await transaction.RollbackAsync();
                                 return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
                             }
-
-                            await transaction.CommitAsync();
                         }
+
+                        using (var insertCmd = new SqlCommand(
+                            @"INSERT INTO BalanceHistory
+                                  (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason, CreatedAt)
+                                VALUES
+                                  (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason, GETDATE());", connection, (SqlTransaction)transaction))
+                        {
+                            insertCmd.Parameters.AddWithValue("@UserId", userId);
+                            insertCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
+                            insertCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
+                            insertCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
+                            insertCmd.Parameters.AddWithValue("@Reason", reason ?? string.Empty);
+
+                            await insertCmd.ExecuteNonQueryAsync();
+                        }
+
+                        await transaction.CommitAsync();
+
                     }
                     catch (Exception ex)
                     {
