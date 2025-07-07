@@ -32,81 +32,68 @@ public class IRISController : ControllerBase
                 try
                 {
                     decimal currentBalance;
-                    decimal newBalance;
                     using (var checkCmd = new MySqlCommand(
                         @"SELECT Balance
-                          FROM Balances
-                          WHERE UserId = @UserId
-                          FOR UPDATE;", connection, transaction))
+                      FROM Balances
+                      WHERE UserId = @UserId
+                      FOR UPDATE;", connection, transaction))
                     {
                         checkCmd.Parameters.AddWithValue("@UserId", userId);
-
                         var result = await checkCmd.ExecuteScalarAsync();
                         if (result == null)
                         {
-                            await transaction.RollbackAsync();
-                            Console.WriteLine($"Không tìm thấy UserId={userId}");
                             return NotFound(new { message = $"Không tìm thấy UserId={userId} trong Balances." });
                         }
-
                         currentBalance = (decimal)result;
-                        decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
-                        if (currentBalance < minBalanceRequired)
-                        {
-                            await transaction.RollbackAsync();
-                            Console.WriteLine($"Rollback for UserId={userId};ChangeAmount={changeAmount}");
-                            return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
-                        }
-
-                        newBalance = currentBalance + changeAmount;
                     }
 
-                    int rowsAffected;
-                    using (var updateCmd = new MySqlCommand(
+                    decimal newBalance = currentBalance + changeAmount;
+
+                    using (var combinedCmd = new MySqlCommand(
                         @"UPDATE Balances
-                          SET Balance = @NewBalance,
-                              LastUpdatedAt = NOW()
-                          WHERE UserId = @UserId;", connection, transaction))
-                    {
-                        updateCmd.Parameters.AddWithValue("@NewBalance", newBalance);
-                        updateCmd.Parameters.AddWithValue("@UserId", userId);
+                      SET Balance = @NewBalance,
+                          LastUpdatedAt = NOW()
+                      WHERE UserId = @UserId
+                        AND Balance >= @MinBalanceRequired;
 
-                        rowsAffected = await updateCmd.ExecuteNonQueryAsync();
-                    }
-
-                    if (rowsAffected != 1)
-                    {
-                        await transaction.RollbackAsync();
-                        Console.WriteLine($"Rollback for UserId={userId}");
-                        return StatusCode(500, new { message = "Cập nhật số dư thất bại. Không thực hiện ghi log." });
-                    }
-
-                    using (var insertCmd = new MySqlCommand(
-                        @"INSERT INTO BalanceHistory
+                      INSERT INTO BalanceHistory
                         (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason)
                       VALUES
                         (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason);", connection, transaction))
                     {
-                        insertCmd.Parameters.AddWithValue("@UserId", userId);
-                        insertCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
-                        insertCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
-                        insertCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
-                        insertCmd.Parameters.AddWithValue("@Reason", reason);
+                        combinedCmd.Parameters.AddWithValue("@NewBalance", newBalance);
+                        combinedCmd.Parameters.AddWithValue("@UserId", userId);
+                        combinedCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
+                        combinedCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
+                        combinedCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
 
-                        await insertCmd.ExecuteNonQueryAsync();
+                        decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
+                        combinedCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
+                        combinedCmd.Parameters.AddWithValue("@Reason", reason);
+
+                        int rowsAffected = await combinedCmd.ExecuteNonQueryAsync();
+
+                        if (rowsAffected < 2)
+                        {
+                            // Không đủ điều kiện (vd: rút tiền nhưng số dư không đủ)
+                            await transaction.RollbackAsync();
+                            return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
+                        }
+
+                        await transaction.CommitAsync();
                     }
-
-                    await transaction.CommitAsync();
-                    return Ok(new { message = "Cập nhật thành công", BalanceAfter = newBalance });
                 }
                 catch (Exception ex)
                 {
                     await transaction.RollbackAsync();
-                    Console.WriteLine($"Rollback for UserId={userId}, Reason: {ex.Message}");
-                    return StatusCode(500, new { message = "Lỗi server", detail = ex.Message });
+                    return StatusCode(500, new { message = $"[TiDB] Error in UserId={userId}", detail = ex.Message });
                 }
-
             }
+
+            return Ok(new
+            {
+                message = $"[TiDB] Updated balance: UserId={userId}, ChangeAmount={changeAmount}, Reason='{reason}'"
+            });
         }
     }
 
@@ -126,40 +113,111 @@ public class IRISController : ControllerBase
             decimal absAmount = (decimal)(random.NextDouble() * 1000);
             decimal changeAmount = reason == "Nap tien" ? absAmount : -absAmount;
 
+            //using (var connection = new SqlConnection(sqlServerConnStr))
+            //{
+            //    await connection.OpenAsync();
+
+            //    decimal currentBalance;
+            //    using (var checkCmd = new SqlCommand("SELECT Balance FROM Balances WHERE UserId = @UserId", connection))
+            //    {
+            //        checkCmd.Parameters.AddWithValue("@UserId", userId);
+            //        var result = await checkCmd.ExecuteScalarAsync();
+            //        if (result == null)
+            //        {
+            //            return NotFound(new { message = $"Không tìm thấy UserId={userId} trong Balances." });
+            //        }
+            //        currentBalance = (decimal)result;
+            //    }
+
+            //    if (Math.Abs(changeAmount) > currentBalance)
+            //    {
+            //        return BadRequest(new { message = $"Rút tiền vượt quá số dư hiện tại: ChangeAmount={changeAmount}, Balance={currentBalance}" });
+            //    }
+            //    decimal newBalance = currentBalance - changeAmount;
+
+            //    using (var command = new SqlCommand("UpdateUserBalance", connection))
+            //    {
+            //        command.CommandType = CommandType.StoredProcedure;
+            //        command.Parameters.AddWithValue("@UserId", userId);
+            //        command.Parameters.AddWithValue("@ChangeAmount", changeAmount); 
+            //        command.Parameters.AddWithValue("@Reason", reason);
+
+            //        await command.ExecuteNonQueryAsync();
+            //    }
+
+            //    return Ok(new { message = $"[SQL Server] Updated balance: UserId={userId}, ChangeAmount={changeAmount}, BalanceBefore={currentBalance}, BalanceAfter={newBalance}, Reason='{reason}'" });
+            //}
             using (var connection = new SqlConnection(sqlServerConnStr))
             {
                 await connection.OpenAsync();
 
-                decimal currentBalance;
-                using (var checkCmd = new SqlCommand("SELECT Balance FROM Balances WHERE UserId = @UserId", connection))
+                using (var transaction = await connection.BeginTransactionAsync())
                 {
-                    checkCmd.Parameters.AddWithValue("@UserId", userId);
-                    var result = await checkCmd.ExecuteScalarAsync();
-                    if (result == null)
+                    try
                     {
-                        return NotFound(new { message = $"Không tìm thấy UserId={userId} trong Balances." });
+                        decimal currentBalance;
+                        using (var checkCmd = new SqlCommand(
+                            @"SELECT Balance            FROM Balances WITH (UPDLOCK, ROWLOCK)
+                              WHERE UserId = @UserId;", connection, (SqlTransaction)transaction))
+                  
+                        {
+                            checkCmd.Parameters.AddWithValue("@UserId", userId);
+                            var result = await checkCmd.ExecuteScalarAsync();
+                            if (result == null)
+                            {
+                                return NotFound(new { message = $"Không tìm thấy UserId={userId} trong Balances." });
+                            }
+                            currentBalance = (decimal)result;
+                        }
+
+                        decimal newBalance = currentBalance + changeAmount;
+
+                        using (var combinedCmd = new SqlCommand(
+                            @"UPDATE Balances
+                              SET Balance = @NewBalance,
+                                  LastUpdatedAt = GETDATE()
+                              WHERE UserId = @UserId
+                                AND Balance >= @MinBalanceRequired;
+
+                              INSERT INTO BalanceHistory
+                                (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason, CreatedAt)
+                              VALUES
+                                (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason, GETDATE());", connection, (SqlTransaction)transaction))
+                        {
+                            combinedCmd.Parameters.AddWithValue("@NewBalance", newBalance);
+                            combinedCmd.Parameters.AddWithValue("@UserId", userId);
+                            combinedCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
+                            combinedCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
+                            combinedCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
+
+                            decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
+                            combinedCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
+                            combinedCmd.Parameters.AddWithValue("@Reason", reason ?? string.Empty);
+
+                            int rowsAffected = await combinedCmd.ExecuteNonQueryAsync();
+
+                            if (rowsAffected < 2)
+                            {
+                                await transaction.RollbackAsync();
+                                return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
+                            }
+
+                            await transaction.CommitAsync();
+                        }
                     }
-                    currentBalance = (decimal)result;
+                    catch (Exception ex)
+                    {
+                        await transaction.RollbackAsync();
+                        return StatusCode(500, new { message = $"[SQL Server] Error in UserId={userId}", detail = ex.Message });
+                    }
                 }
 
-                if (Math.Abs(changeAmount) > currentBalance)
+                return Ok(new
                 {
-                    return BadRequest(new { message = $"Rút tiền vượt quá số dư hiện tại: ChangeAmount={changeAmount}, Balance={currentBalance}" });
-                }
-                decimal newBalance = currentBalance - changeAmount;
-
-                using (var command = new SqlCommand("UpdateUserBalance", connection))
-                {
-                    command.CommandType = CommandType.StoredProcedure;
-                    command.Parameters.AddWithValue("@UserId", userId);
-                    command.Parameters.AddWithValue("@ChangeAmount", changeAmount); 
-                    command.Parameters.AddWithValue("@Reason", reason);
-
-                    await command.ExecuteNonQueryAsync();
-                }
-
-                return Ok(new { message = $"[SQL Server] Updated balance: UserId={userId}, ChangeAmount={changeAmount}, BalanceBefore={currentBalance}, BalanceAfter={newBalance}, Reason='{reason}'" });
+                    message = $"[SQL Server] Updated balance: UserId={userId}, ChangeAmount={changeAmount}, Reason='{reason}'"
+                });
             }
+
         }
         catch (Exception ex)
         {
