@@ -8,9 +8,8 @@ using System.Diagnostics;
 [Route("api/[controller]")]
 public class IRISController : ControllerBase
 {
-    private readonly string tidbConnStr = "Server=127.0.0.1;Port=4000;User ID=root;Password=;Database=test;";
+    private readonly string tidbConnStr = "Server=127.0.0.1;Port=4000;User ID=root;Password=;Database=test;SslMode=None;UseAffectedRows=True";
     private readonly string sqlServerConnStr = "Server=127.0.0.1,1433;User ID=sa;Password=YourStrong!Passw0rd;Database=master;TrustServerCertificate=True;";
-    private static readonly object RandomLock = new object();
     [HttpGet("tidb")]
     public async Task<IActionResult> GetTidb()
     {
@@ -39,6 +38,7 @@ public class IRISController : ControllerBase
                       FOR UPDATE;", connection, transaction))
                     {
                         checkCmd.Parameters.AddWithValue("@UserId", userId);
+                        await checkCmd.PrepareAsync();
                         var result = await checkCmd.ExecuteScalarAsync();
                         if (result == null)
                         {
@@ -70,6 +70,7 @@ public class IRISController : ControllerBase
                         decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
                         combinedCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
                         combinedCmd.Parameters.AddWithValue("@Reason", reason);
+                        await combinedCmd.PrepareAsync();
 
                         int rowsAffected = await combinedCmd.ExecuteNonQueryAsync();
 
@@ -125,6 +126,7 @@ public class IRISController : ControllerBase
                     {
                         checkCmd.Parameters.AddWithValue("@UserId", userId);
                         var result = await checkCmd.ExecuteScalarAsync();
+                        
                         if (result == null)
                         {
                             return NotFound(new { message = $"Không tìm thấy UserId={userId} trong Balances." });
@@ -145,6 +147,7 @@ public class IRISController : ControllerBase
                         updateCmd.Parameters.AddWithValue("@UserId", userId);
                         decimal minBalanceRequired = 0 - changeAmount;
                         updateCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
+                        await updateCmd.PrepareAsync();
 
                         int rowsAffected = await updateCmd.ExecuteNonQueryAsync();
 
@@ -185,6 +188,123 @@ public class IRISController : ControllerBase
                 message = $"[TiDB] Updated balance: UserId={userId}, ChangeAmount={changeAmount}, Reason='{reason}'"
             });
         }
+    }
+
+    // Sử dụng PS
+    [HttpGet("tidbps")]
+    public async Task<IActionResult> GetTidbps()
+    {
+        var random = new Random();
+        int userId = random.Next(0, 1001);
+        string[] reasons = { "Nap tien", "Rut tien" };
+        string reason = reasons[random.Next(reasons.Length)];
+        decimal absAmount = (decimal)(random.NextDouble() * 1000);
+        decimal changeAmount = reason == "Nap tien" ? absAmount : -absAmount;
+
+        using var connection = new MySqlConnection(tidbConnStr);
+        await connection.OpenAsync();
+
+        using var transaction = await connection.BeginTransactionAsync();
+
+        try
+        {
+            using (var cmd = new MySqlCommand(
+                "PREPARE checkStmt FROM 'SELECT Balance FROM Balances WHERE UserId = ? FOR UPDATE';", connection, transaction))
+            {
+                await cmd.ExecuteNonQueryAsync();
+            }
+            using (var cmd = new MySqlCommand("SET @uid = @UserId;", connection, transaction))
+            {
+                cmd.Parameters.AddWithValue("@UserId", userId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            decimal currentBalance;
+            using (var cmd = new MySqlCommand("EXECUTE checkStmt USING @uid;", connection, transaction))
+            using (var reader = await cmd.ExecuteReaderAsync())
+            {
+                if (!await reader.ReadAsync())
+                {
+                    return NotFound(new { message = $"Không tìm thấy UserId={userId} trong Balances." });
+                }
+                currentBalance = reader.GetDecimal(0);
+            }
+            using (var cmd = new MySqlCommand("DEALLOCATE PREPARE checkStmt;", connection, transaction))
+            {
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            decimal newBalance = currentBalance + changeAmount;
+            decimal minBalance = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
+            string updateSql = @"
+                UPDATE Balances
+                SET Balance = ?, LastUpdatedAt = NOW()
+                WHERE UserId = ? AND Balance >= ?;
+
+                INSERT INTO BalanceHistory
+                (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason)
+                VALUES (?, ?, ?, ?, ?);";
+
+            using (var cmd = new MySqlCommand("PREPARE updateStmt FROM @sql;", connection, transaction))
+            {
+                cmd.Parameters.AddWithValue("@sql", updateSql);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            using (var cmd = new MySqlCommand(@"
+                SET 
+                @b = @NewBalance,
+                @u = @UserId,
+                @min = @MinBalance,
+                @c = @ChangeAmount,
+                @before = @Before,
+                @after = @After,
+                @r = @Reason;", connection, transaction))
+            {
+                cmd.Parameters.AddWithValue("@NewBalance", newBalance);
+                cmd.Parameters.AddWithValue("@UserId", userId);
+                cmd.Parameters.AddWithValue("@MinBalance", minBalance);
+                cmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
+                cmd.Parameters.AddWithValue("@Before", currentBalance);
+                cmd.Parameters.AddWithValue("@After", newBalance);
+                cmd.Parameters.AddWithValue("@Reason", reason);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            int rowsAffected;
+            using (var cmd = new MySqlCommand(@"
+                EXECUTE updateStmt 
+                USING @b, @u, @min, @u, @c, @before, @after, @r;", connection, transaction))
+            {
+                rowsAffected = await cmd.ExecuteNonQueryAsync();
+            }
+
+            using (var cmd = new MySqlCommand("DEALLOCATE PREPARE updateStmt;", connection, transaction))
+            {
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            if (rowsAffected < 2)
+            {
+                await transaction.RollbackAsync();
+                return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
+            }
+
+            await transaction.CommitAsync();
+            return Ok(new
+            {
+                message = $"[TiDB] Updated balance thành công: UserId={userId}, Amount={changeAmount}, Reason='{reason}'"
+            });
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync();
+            return StatusCode(500, new
+            {
+                message = $"[TiDB] Lỗi trong quá trình xử lý UserId={userId}",
+                detail = ex.Message
+            });
+        }
+
     }
     // Sử dụng rawSQL
     [HttpGet("sqlserver")]
