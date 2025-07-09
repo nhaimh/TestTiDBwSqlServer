@@ -8,8 +8,9 @@ using System.Diagnostics;
 [Route("api/[controller]")]
 public class IRISController : ControllerBase
 {
-    private readonly string tidbConnStr = "Server=127.0.0.1;Port=4000;User ID=root;Password=;Database=test;SslMode=None;UseAffectedRows=True";
+    private readonly string tidbConnStr = "Server=127.0.0.1;Port=4000;User ID=root;Password=;Database=test;";
     private readonly string sqlServerConnStr = "Server=127.0.0.1,1433;User ID=sa;Password=YourStrong!Passw0rd;Database=master;TrustServerCertificate=True;";
+    private static readonly object RandomLock = new object();
     [HttpGet("tidb")]
     public async Task<IActionResult> GetTidb()
     {
@@ -37,8 +38,8 @@ public class IRISController : ControllerBase
                       WHERE UserId = @UserId
                       FOR UPDATE;", connection, transaction))
                     {
+                        //checkCmd.Prepare();
                         checkCmd.Parameters.AddWithValue("@UserId", userId);
-                        await checkCmd.PrepareAsync();
                         var result = await checkCmd.ExecuteScalarAsync();
                         if (result == null)
                         {
@@ -61,6 +62,7 @@ public class IRISController : ControllerBase
                       VALUES
                         (@UserId, @ChangeAmount, @BalanceBefore, @BalanceAfter, @Reason);", connection, transaction))
                     {
+                        //combinedCmd.Prepare();
                         combinedCmd.Parameters.AddWithValue("@NewBalance", newBalance);
                         combinedCmd.Parameters.AddWithValue("@UserId", userId);
                         combinedCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
@@ -70,7 +72,6 @@ public class IRISController : ControllerBase
                         decimal minBalanceRequired = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
                         combinedCmd.Parameters.AddWithValue("@MinBalanceRequired", minBalanceRequired);
                         combinedCmd.Parameters.AddWithValue("@Reason", reason);
-                        await combinedCmd.PrepareAsync();
 
                         int rowsAffected = await combinedCmd.ExecuteNonQueryAsync();
 
@@ -203,25 +204,26 @@ public class IRISController : ControllerBase
 
         using var connection = new MySqlConnection(tidbConnStr);
         await connection.OpenAsync();
-
         using var transaction = await connection.BeginTransactionAsync();
 
         try
         {
-            using (var cmd = new MySqlCommand(
-                "PREPARE checkStmt FROM 'SELECT Balance FROM Balances WHERE UserId = ? FOR UPDATE';", connection, transaction))
+            await using (var prepareSelectCmd = new MySqlCommand(
+                "PREPARE checkStmt FROM 'SELECT Balance FROM Balances WHERE UserId = ? FOR UPDATE';",
+                connection, transaction))
             {
-                await cmd.ExecuteNonQueryAsync();
+                await prepareSelectCmd.ExecuteNonQueryAsync();
             }
-            using (var cmd = new MySqlCommand("SET @uid = @UserId;", connection, transaction))
+
+            await using (var setUidCmd = new MySqlCommand("SET @uid = @UserId;", connection, transaction))
             {
-                cmd.Parameters.AddWithValue("@UserId", userId);
-                await cmd.ExecuteNonQueryAsync();
+                setUidCmd.Parameters.AddWithValue("@UserId", userId);
+                await setUidCmd.ExecuteNonQueryAsync();
             }
 
             decimal currentBalance;
-            using (var cmd = new MySqlCommand("EXECUTE checkStmt USING @uid;", connection, transaction))
-            using (var reader = await cmd.ExecuteReaderAsync())
+            await using (var execCheckCmd = new MySqlCommand("EXECUTE checkStmt USING @uid;", connection, transaction))
+            await using (var reader = await execCheckCmd.ExecuteReaderAsync())
             {
                 if (!await reader.ReadAsync())
                 {
@@ -229,67 +231,79 @@ public class IRISController : ControllerBase
                 }
                 currentBalance = reader.GetDecimal(0);
             }
-            using (var cmd = new MySqlCommand("DEALLOCATE PREPARE checkStmt;", connection, transaction))
+
+            await using (var deallocCheck = new MySqlCommand("DEALLOCATE PREPARE checkStmt;", connection, transaction))
             {
-                await cmd.ExecuteNonQueryAsync();
+                await deallocCheck.ExecuteNonQueryAsync();
             }
 
             decimal newBalance = currentBalance + changeAmount;
             decimal minBalance = changeAmount < 0 ? Math.Abs(changeAmount) : 0;
+            DateTime now = DateTime.UtcNow;
+
             string updateSql = @"
-                UPDATE Balances
-                SET Balance = ?, LastUpdatedAt = NOW()
-                WHERE UserId = ? AND Balance >= ?;
+        UPDATE Balances
+        SET Balance = ?, LastUpdatedAt = ?
+        WHERE UserId = ? AND Balance >= ?;
 
-                INSERT INTO BalanceHistory
-                (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason)
-                VALUES (?, ?, ?, ?, ?);";
+        INSERT INTO BalanceHistory
+            (UserId, ChangeAmount, BalanceBefore, BalanceAfter, Reason)
+        VALUES
+            (?, ?, ?, ?, ?);
+    ";
 
-            using (var cmd = new MySqlCommand("PREPARE updateStmt FROM @sql;", connection, transaction))
+            await using (var prepareUpdate = new MySqlCommand("PREPARE updateStmt FROM @sql;", connection, transaction))
             {
-                cmd.Parameters.AddWithValue("@sql", updateSql);
-                await cmd.ExecuteNonQueryAsync();
+                prepareUpdate.Parameters.AddWithValue("@sql", updateSql);
+                await prepareUpdate.ExecuteNonQueryAsync();
             }
-            using (var cmd = new MySqlCommand(@"
-                SET 
-                @b = @NewBalance,
-                @u = @UserId,
-                @min = @MinBalance,
-                @c = @ChangeAmount,
-                @before = @Before,
-                @after = @After,
-                @r = @Reason;", connection, transaction))
+
+            await using (var setVarsCmd = new MySqlCommand(@"
+        SET 
+            @b = @NewBalance,
+            @t = @Timestamp,
+            @u = @UserId,
+            @m = @MinBalance,
+            @c = @ChangeAmount,
+            @bf = @BalanceBefore,
+            @af = @BalanceAfter,
+            @r = @Reason;
+    ", connection, transaction))
             {
-                cmd.Parameters.AddWithValue("@NewBalance", newBalance);
-                cmd.Parameters.AddWithValue("@UserId", userId);
-                cmd.Parameters.AddWithValue("@MinBalance", minBalance);
-                cmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
-                cmd.Parameters.AddWithValue("@Before", currentBalance);
-                cmd.Parameters.AddWithValue("@After", newBalance);
-                cmd.Parameters.AddWithValue("@Reason", reason);
-                await cmd.ExecuteNonQueryAsync();
+                setVarsCmd.Parameters.AddWithValue("@NewBalance", newBalance);
+                setVarsCmd.Parameters.AddWithValue("@Timestamp", now);
+                setVarsCmd.Parameters.AddWithValue("@UserId", userId);
+                setVarsCmd.Parameters.AddWithValue("@MinBalance", minBalance);
+                setVarsCmd.Parameters.AddWithValue("@ChangeAmount", changeAmount);
+                setVarsCmd.Parameters.AddWithValue("@BalanceBefore", currentBalance);
+                setVarsCmd.Parameters.AddWithValue("@BalanceAfter", newBalance);
+                setVarsCmd.Parameters.AddWithValue("@Reason", reason);
+                await setVarsCmd.ExecuteNonQueryAsync();
             }
 
             int rowsAffected;
-            using (var cmd = new MySqlCommand(@"
-                EXECUTE updateStmt 
-                USING @b, @u, @min, @u, @c, @before, @after, @r;", connection, transaction))
+            await using (var execUpdate = new MySqlCommand(
+                "EXECUTE updateStmt USING @b, @t, @u, @m, @u, @c, @bf, @af, @r;", connection, transaction))
             {
-                rowsAffected = await cmd.ExecuteNonQueryAsync();
+                rowsAffected = await execUpdate.ExecuteNonQueryAsync();
             }
 
-            using (var cmd = new MySqlCommand("DEALLOCATE PREPARE updateStmt;", connection, transaction))
+            await using (var deallocUpdate = new MySqlCommand("DEALLOCATE PREPARE updateStmt;", connection, transaction))
             {
-                await cmd.ExecuteNonQueryAsync();
+                await deallocUpdate.ExecuteNonQueryAsync();
             }
 
             if (rowsAffected < 2)
             {
                 await transaction.RollbackAsync();
-                return BadRequest(new { message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}" });
+                return BadRequest(new
+                {
+                    message = $"Không đủ số dư: ChangeAmount={changeAmount}, Balance={currentBalance}"
+                });
             }
 
             await transaction.CommitAsync();
+
             return Ok(new
             {
                 message = $"[TiDB] Updated balance thành công: UserId={userId}, Amount={changeAmount}, Reason='{reason}'"
@@ -304,7 +318,6 @@ public class IRISController : ControllerBase
                 detail = ex.Message
             });
         }
-
     }
     // Sử dụng rawSQL
     [HttpGet("sqlserver")]
